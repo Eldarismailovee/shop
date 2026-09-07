@@ -1,0 +1,26 @@
+---
+paths:
+  - "domains/**/public.py"
+  - "application/**/public.py"
+  - "domains/**/dto.py"
+  - "application/**/dto.py"
+  - "domains/**/dtos.py"
+  - "application/**/dtos.py"
+  - "domains/**/dto/**/*.py"
+  - "application/**/dto/**/*.py"
+  - "domains/**/dtos/**/*.py"
+  - "application/**/dtos/**/*.py"
+---
+# `public.py` contract rules (item 4 / ADR-0006)
+- A `public.py` is a **thin façade**: explicit imports, explicit `__all__`, **no `class`, no `def`**, no wildcard/alias/module re-export, no import-time side effect, no logic.
+- Forbidden exports: ORM models, managers, QuerySets, internal services/selectors, transport types (Django/DRF/Celery), vendor SDK or wire types, cache/search types, lazy objects, and anything reached only by a lazy import.
+- DTO baseline: `@dataclass(frozen=True, slots=True, kw_only=True)`, immutable **by field type** — `tuple`/`frozenset`/nested frozen DTOs only. No `list`/`dict`/`set`/`Any`, no `Mapping`/`Sequence`; key/value data is a frozen tuple of pairs. Instants are aware UTC. `Money`/`PublicId` for money and locators.
+- **No `id`/`pk` field on a public DTO.** An internal identifier may never become a user locator, a public API payload identifier, an external webhook/integration identifier, or an externally consumed event identifier.
+- **Commands**: business verb, frozen result or `None`; no direct external/vendor network I/O (the module's own PostgreSQL work and its transactional Outbox row are not that); emit an Outbox row rather than scheduling a task.
+- **Selectors**: materialised immutable results — no QuerySet, no lazy object, no paginator. Only disposable cache/metrics/tracing side effects; never a durable business/authorization/audit/compliance write.
+- **Authorization by construction**: a public read takes no actor; a protected operation takes an explicit, mandatory, non-optional actor **first**. `actor=None` is banned; privileged access is an explicit system context.
+- **Transactions**: one semantic command; nesting is a savepoint implementation detail. No independent commit, no `durable=True` — the application owns the outer transaction.
+- **Errors**: expected domain failures are domain-owned errors over `core`'s closed, business-free category set (a uniqueness race translated only at a nested savepoint, and only when the violated invariant is named). Technical and unexpected faults propagate **untranslated** and are never dressed as business errors.
+- No trace/TCE argument appears in any `public.py` signature, command input DTO, selector parameter or DTO field — capture is ambient, inside `core.events`.
+- `application/<a>/public.py` is the application entry-point convention; **application → application imports are forbidden**. `application/storefront/public.py` additionally exposes no ORM/QuerySet/paginator.
+- Changing a published contract follows the three-class compatibility policy; a breaking change is a new contract, not an in-place edit.

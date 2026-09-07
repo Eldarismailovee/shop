@@ -1,0 +1,23 @@
+---
+paths:
+  - "tasks/**/*.py"
+  - "tasks/**/tests.py"
+  - "tasks/**/tests/**/*.py"
+---
+# Celery task / async transport rules
+- `tasks/*` is a **thin transport wrapper**. It deserializes, calls an `application`/`domain` public entry point, and translates the outcome into a transport disposition. No business logic, no pricing, no state machine, no direct ORM writes.
+- `tasks/*` **never imports `integrations/*`** and **never imports `config/*`**. An entry point **receives** its dependencies from the composition root; it never service-locates them, builds an adapter, reads settings for a binding, or imports a container.
+- `tasks/*` is never an event owner or producer of a registered message contract; the owning module authors the message.
+- Route work by **logical failure domain**, assigned **per consumer declaration** — never by the producer, never per `(event_type, schema_version)`. A routing change never bumps `schema_version`. There is no general-purpose `default`/`external`/`misc` queue, and priority is not isolation.
+- Every retry policy is owned by the failure domain and is **finite**: bounded attempts and/or age, increasing backoff with mandatory jitter, an explicit terminal disposition, and no worker slot held while sleeping.
+- Terminal states are two distinct things, and neither is called "failed":
+  - **contract quarantine** — unknown `event_type`, unsupported `schema_version`, invalid payload, or an `event_id` seen before with different content. Durable + alert, committed **before** the transport disposes of the delivery, never marked HANDLED, never coerced, never hot-looping;
+  - **operational dead-letter** — understood work whose execution budget is exhausted, recorded for **that consumer delivery**.
+- Both terminal states are **canonically durable in PostgreSQL**, in a per-domain namespace that names *which* consumer failed. The **broker DLQ is transport only**. If the terminal write fails, the delivery is **not** disposed of.
+- **Handler transaction rule (HT1), where it applies:** where a consumer has a correctness-relevant durable local effect whose atomicity matters, the Inbox claim/identity handling + that local effect + the resulting Outbox rows + the successful Inbox completion belong to **one local PostgreSQL transaction**. This does not require a consumer to invent a durable local business effect it does not have.
+- The Inbox is **never marked handled before the effect it protects is durable**, and **no provider or network I/O happens inside that transaction**.
+- Provider-facing work follows HT4: persist local intent → `COMMIT` → perform the external call in the post-commit workflow, under the provider idempotency key, its state machine and reconciliation.
+- Neither shape weakens Inbox identity integrity or the per-consumer effect-idempotency declaration; both obligations stand independently.
+- Replay is explicit, authorised, audited and identity-preserving; it re-enters normal validation and idempotency with **no force-apply path**, is scoped to the **failed consumer delivery**, and never rebroadcasts to a sibling consumer that already succeeded. A genuinely new business attempt is a **new message with a new `event_id`**, not a replay.
+- A consumer delivery's own processing span is new per attempt; the message's four TCE fields (`trace_id`, `producer_span_id`, `request_id`, `causation_event_id`) are immutable at the consumer and are never back-filled.
+- Test timeout, duplicate delivery, out-of-order, provider-down, retry-exhaustion, quarantine and replay paths.

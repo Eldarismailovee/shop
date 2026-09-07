@@ -1,0 +1,5 @@
+# Personal local overrides
+
+# Rename to CLAUDE.local.md and keep it uncommitted.
+# Good uses: local test URLs, preferred test account aliases, machine-specific commands.
+# Never place secrets or API keys here.

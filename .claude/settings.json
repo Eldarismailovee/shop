@@ -1,0 +1,57 @@
+{
+  "model": "claude-opus-5",
+  "effortLevel": "high",
+  "fastModePerSessionOptIn": true,
+  "disableSkillShellExecution": true,
+  "permissions": {
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./secrets/**)",
+      "Read(./credentials/**)",
+      "Read(./config/credentials*.json)",
+      "Read(./**/*.pem)",
+      "Read(./**/*.key)",
+      "Read(./**/*.p12)",
+      "Read(./**/*.pfx)",
+      "Read(./.venv/**)",
+      "Read(./venv/**)",
+      "Read(./node_modules/**)",
+      "Read(./vendor/**)",
+      "Read(./.git/**)",
+      "Read(./__pycache__/**)",
+      "Read(./**/__pycache__/**)",
+      "Read(./.pytest_cache/**)",
+      "Read(./.mypy_cache/**)",
+      "Read(./.ruff_cache/**)",
+      "Read(./.coverage)",
+      "Read(./htmlcov/**)",
+      "Read(./coverage/**)",
+      "Read(./build/**)",
+      "Read(./dist/**)",
+      "Read(./staticfiles/**)",
+      "Read(./media/**)",
+      "Read(./tmp/**)",
+      "Read(./temp/**)",
+      "Read(./logs/**)",
+      "Read(./**/*.log)",
+      "Read(./**/*.sqlite3)",
+      "Read(./**/*.dump)",
+      "Read(./**/*.sql.gz)",
+      "Read(./docs/generated/**)"
+    ],
+    "ask": [
+      "Bash(git push *)",
+      "Bash(git reset --hard *)",
+      "Bash(git clean *)",
+      "Bash(rm -rf *)",
+      "Bash(docker compose down -v *)",
+      "Bash(dropdb *)"
+    ]
+  },
+  "env": {
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONUNBUFFERED": "1"
+  },
+  "autoMemoryEnabled": false
+}

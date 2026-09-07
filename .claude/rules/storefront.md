@@ -1,0 +1,30 @@
+---
+paths:
+  - "application/storefront/**/*.py"
+  - "interfaces/web/**/*catalog*.py"
+  - "interfaces/api/**/*catalog*.py"
+  - "interfaces/web/**/*storefront*.py"
+  - "interfaces/api/**/*storefront*.py"
+  - "interfaces/web/**/catalog/**/*.py"
+  - "interfaces/web/**/storefront/**/*.py"
+  - "interfaces/api/**/catalog/**/*.py"
+  - "interfaces/api/**/storefront/**/*.py"
+---
+# Storefront hot-path rules
+- `ProductListingProjection` is the hot read source for catalog/list/facets; `application/storefront` is its sole owner and sole writer. A miss never falls back to a request-time OLTP join.
+- Keep listing queries join-free against OLTP wherever designed; use local B-tree/GIN indexes.
+- Selectors return immutable `ProductCard`/facet DTOs used by both Web and API. No ORM object, QuerySet or paginator crosses `application/storefront/public.py`.
+- Keyset pagination uses a compact `(sort_field, internal id)` order at the visible grain established at build time; the public UUID is not the composite-index tiebreaker, and internal bigints leave only inside a signed opaque cursor.
+- **Projection writes converge by compare-and-set, not by source ordering (ADR-0014 / item 12):**
+  - a trigger is a **dirty-identity signal** only — never a row snapshot, never a freshness token;
+  - **observe** the row's `projection_revision` **before** every source read's visibility point;
+  - **rebuild the whole candidate** from **authoritative** current state through `<domain>.public` batch selectors — never from a cache entry, a lagging replica or a snapshot opened earlier;
+  - **commit only if the observed token is still equal** (equality only, never `>`), advancing the token iff serving state changes;
+  - a **guard miss** is ordinary contention: discard the candidate whole, re-observe, rebuild, bounded jittered retry — never a business error, a quarantine or a request-path effect;
+  - an **unchanged candidate writes nothing at all**: no `UPDATE`, no token advance, no `updated_at` change;
+  - the logical guard unit is the **product** (all its language rows all-or-nothing); the physical write transaction is a bounded batch with a deterministic product → language lock order and no source read inside it;
+  - withdrawal is a forward not-visible change, not a delete (a deleted row destroys the guard token); tombstone collection and any build-then-swap need a fence that invalidates every prior observation.
+- Do **not** introduce `source_version`, a monotonic source-version guard, a producer-supplied freshness token, a `popularity_version`, or any force-write path. No producer supplies a version and no domain learns it is projected.
+- Rebuild, targeted rebuild, reconciliation and replay run the **identical** protocol; the projection is fully rebuildable from OLTP with no event history.
+- Facet predicates over variant-scope attributes must be evaluated inside the single-variant existential; the product-level union array is for product-scope predicates and count candidacy only.
+- Preserve query budgets, N+1 tests, crawl/query-cost guards, fragment cache, and single-flight behavior.

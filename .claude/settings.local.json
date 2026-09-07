@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -)",
+      "Skill(architecture-context)",
+      "Skill(architecture-context:*)"
+    ]
+  }
+}

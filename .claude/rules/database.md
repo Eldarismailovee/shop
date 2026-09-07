@@ -1,0 +1,22 @@
+---
+paths:
+  - "**/models.py"
+  - "**/models/**/*.py"
+  - "**/migrations/*.py"
+  - "**/selectors.py"
+  - "**/selectors/**/*.py"
+  - "**/*repository*.py"
+---
+# PostgreSQL / ORM rules
+- Correctness-critical invariants should have DB constraints/unique constraints where representable.
+- Prefer set-based SQL/ORM updates to per-row loops for imports and projections.
+- Index for measured query shapes; avoid redundant indexes on hot mutable tables.
+- Avoid `SELECT *` on heavy JSON/text/event payload models. Shape read queries deliberately.
+- Keep transactions short; acquire inventory/coupon locks after preparation. No transaction spans a network call.
+- All application reads go to **primary**; there is no replica alias, router or sticky-primary machinery (ADR-0016). An HA standby is not an application read target.
+- Idempotency tables are five separate concerns — local command `IdempotencyKey` `UNIQUE (scope, key)` + principal + semantic fingerprint; Inbox/`EventId` delivery identity; provider `external_event_id` webhook dedupe; outbound provider idempotency key; and the domain `UNIQUE`/state machine that makes the business effect permanent. Do not merge them or name one after another.
+- The generic `IdempotencyKey` carries **no durable `processing` or `failed` state**, no cookies/headers/credentials, no unbounded JSON and no polymorphic cross-domain FK; keep heavy result material off the claim path. Retention expiry ends the replay promise, so a permanently single-use rule needs its own domain constraint.
+- Outbox/Inbox carry `event_id`, `event_type`, `schema_version`, `occurred_at` plus the four TCE fields (`trace_id`, `producer_span_id`, `request_id`, `causation_event_id`) **from the initial migration** — no partitioning migration precedes them, and no TCE field is a partition, ordering or uniqueness key.
+- Quarantine and dead-letter are PostgreSQL-canonical terminal state in per-domain namespaces that name which consumer delivery failed.
+- Migrations should be safe for production data volume; use expand/contract for risky schema changes.
+- Use `EXPLAIN (ANALYZE, BUFFERS)`/`pg_stat_statements` evidence for performance changes rather than guesses.
