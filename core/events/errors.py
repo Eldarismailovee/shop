@@ -23,7 +23,12 @@ names a table or a queue.
 
 from __future__ import annotations
 
-__all__ = ("MessageContractError", "UnknownEventType", "UnsupportedSchemaVersion")
+__all__ = (
+    "InvalidPayload",
+    "MessageContractError",
+    "UnknownEventType",
+    "UnsupportedSchemaVersion",
+)
 
 
 class MessageContractError(Exception):
@@ -36,6 +41,17 @@ class MessageContractError(Exception):
 
 class UnknownEventType(MessageContractError):
     """No registered message carries this `event_type` at any version."""
+
+
+class InvalidPayload(MessageContractError):
+    """The payload is not admissible for a durable message (item 8 PD5, PD8, §29).
+
+    Raised on both edges by `core/events/codec.py`: at emission, when a producer offers a
+    shape that cannot be rendered deterministically or exceeds the bound; and at consumption,
+    when stored or transported text is not in canonical form. Like its siblings it is **not**
+    a `core.errors.DomainError` — an invalid payload is a contract-integrity failure whose
+    outcome is durable quarantine plus an alert, never a business state transition.
+    """
 
 
 class UnsupportedSchemaVersion(MessageContractError):

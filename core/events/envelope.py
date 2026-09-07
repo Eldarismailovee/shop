@@ -42,8 +42,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from core.events.identity import EventId
+from core.observability.request_id import REQUEST_ID_MAX_LENGTH, normalised_request_id
 
-__all__ = ("Envelope",)
+__all__ = (
+    "Envelope",
+    "normalised_request_id",
+    "normalised_span_id",
+    "normalised_trace_id",
+)
 
 #: NM1/NM2/NM3: lowercase dot-separated segments, the first being the semantic owner's
 #: stable module name and the rest naming the fact or the work item. Owner-qualification is
@@ -60,14 +66,11 @@ _TRACE_ID = re.compile(r"\A(?!0{32}\Z)[0-9a-f]{32}\Z")
 #: being invalid.
 _SPAN_ID = re.compile(r"\A(?!0{16}\Z)[0-9a-f]{16}\Z")
 
-#: RQ6: a bounded-length opaque token. The platform parses no structure out of it, derives
-#: nothing from it and sorts nothing by it. The bound is a Phase-1 choice.
-_REQUEST_ID_MAX_LENGTH = 128
-_REQUEST_ID = re.compile(r"\A[\x21-\x7e]+\Z")
-
-#: PR6: `request_id` is present or absent, with no third state. These are the stand-ins
-#: that would smuggle one in.
-_REQUEST_ID_PLACEHOLDERS = frozenset({"-", "none", "null", "unknown"})
+#: RQ6/PR6: the shape of a `request_id`, and the decision that turns a candidate into one,
+#: are owned by `core.observability.request_id` and imported above. The boundary that *mints*
+#: a value is a transport boundary, and `interfaces/*` may import `core.observability` but not
+#: `core.events` at all (item 3 §4.4) — so stating the rule here as well would leave the
+#: adopting boundary and the storing envelope free to drift apart on one validation.
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -114,6 +117,23 @@ class Envelope:
             _require_causation(self.causation_event_id, self.event_id)
 
 
+def normalised_trace_id(value: object) -> str | None:
+    """A valid `trace_id`, or `None` — never an exception and never a repair (PR3, PR5).
+
+    Capture normalises: a malformed, all-zero, wrongly-cased or absent inbound identifier
+    becomes **absent**, which is a complete and legal TCE state (FS5, FS10). It is never
+    stored as-is, never padded, never re-cased and never invented. The constructor above
+    still raises on a bad value, because a caller that builds an `Envelope` by hand is
+    asserting the value is good; these three functions are the boundary that decides.
+    """
+    return value if type(value) is str and _TRACE_ID.fullmatch(value) else None
+
+
+def normalised_span_id(value: object) -> str | None:
+    """A valid `producer_span_id`, or `None` (PR3, PR5). See `normalised_trace_id`."""
+    return value if type(value) is str and _SPAN_ID.fullmatch(value) else None
+
+
 def _require_event_type(value: str) -> None:
     if type(value) is not str:
         raise TypeError(f"event_type must be a string, got {type(value).__name__}")
@@ -158,11 +178,11 @@ def _require_pattern(pattern: re.Pattern[str], value: str, field: str, shape: st
 def _require_request_id(value: str) -> None:
     if type(value) is not str:
         raise TypeError(f"request_id must be a string, got {type(value).__name__}")
-    if len(value) > _REQUEST_ID_MAX_LENGTH:
+    if len(value) > REQUEST_ID_MAX_LENGTH:
         raise ValueError(
-            f"request_id must be at most {_REQUEST_ID_MAX_LENGTH} characters, got {len(value)}"
+            f"request_id must be at most {REQUEST_ID_MAX_LENGTH} characters, got {len(value)}"
         )
-    if not _REQUEST_ID.fullmatch(value) or value.lower() in _REQUEST_ID_PLACEHOLDERS:
+    if normalised_request_id(value) is None:
         raise ValueError(
             f"{value!r} is not an opaque request_id token; absence means system origin and "
             f"is spelled by leaving the field out, never by a placeholder"

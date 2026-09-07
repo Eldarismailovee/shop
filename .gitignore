@@ -12,3 +12,9 @@ media/
 .env
 .env.*
 CLAUDE.local.md
+docs/
+.claude/
+.claude*
+CLAUDE.md
+text.md
+README_CLAUDE_CODE.md

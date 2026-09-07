@@ -54,6 +54,11 @@ def test_a1_allows_a_model_in_an_application_models_module(tmp_path, arch_rules)
 
 
 def test_a1_allows_a_core_infrastructure_model(tmp_path, arch_rules):
+    """A1 permits the model; A130 separately requires it to declare its unique constraint.
+
+    This fixture is a bare model, so A130 fires and is expected here — the assertion is
+    about A1 alone, and the full-constraint case lives in `test_idempotency_rules.py`.
+    """
     found = arch_rules(
         tmp_path,
         {
@@ -62,7 +67,8 @@ def test_a1_allows_a_core_infrastructure_model(tmp_path, arch_rules):
             )
         },
     )
-    assert found == set()
+    assert "A1" not in found
+    assert found == {"A130"}
 
 
 def test_a1_rejects_the_model_module_outside_a_model_location(tmp_path, arch_rules):

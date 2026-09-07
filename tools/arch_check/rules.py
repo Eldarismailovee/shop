@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeGuard
 
+from core.observability.masking import is_sensitive
 from tools.arch_check.model import SourceModule, Violation, discover, under
 
 
@@ -1271,6 +1272,956 @@ def a82_uuid_mechanism_is_core_internal(m: SourceModule, ctx: Context) -> Iterat
                 imp.line,
                 f"{imp.target} is the core-internal UUIDv7 mechanism; import the semantic "
                 "type (core.public_id.PublicId or core.events.identity.EventId) instead",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Command idempotency (ADR-0015, item 15 §13.1 A129-A138)
+# ---------------------------------------------------------------------------
+
+#: A129: the claim is a PostgreSQL write. No Redis command, in-process lock, file lock or
+#: advisory-lock-only path may stand in for it, and no command may be correct only while
+#: Redis is warm. Redis may damp bursts *somewhere else*; it may not appear in the claim
+#: mechanism, so the rule is stated as an import ban over the whole submodule.
+_IDEMPOTENCY_FORBIDDEN_IMPORTS = (
+    "redis",
+    "django_redis",
+    "memcache",
+    "pymemcache",
+    "threading",
+    "multiprocessing",
+    "filelock",
+    "core.cache",
+    "django.core.cache",
+)
+
+#: A129: nor by another spelling of the same idea.
+_IDEMPOTENCY_FORBIDDEN_CALLS = (
+    "pg_advisory_lock",
+    "pg_advisory_xact_lock",
+    "pg_try_advisory_lock",
+)
+
+#: A131: the claim commits with the effect it protects. An independent commit, an
+#: autocommit toggle or a post-commit hook would each recreate the separately committed
+#: `processing` row ADR-0015 §6 forbids by name.
+_IDEMPOTENCY_FORBIDDEN_TRANSACTION_CALLS = (
+    "commit",
+    "rollback",
+    "set_autocommit",
+    "on_commit",
+    "get_autocommit",
+)
+
+#: A132: no durable `processing`/`failed` state. The surest way to guarantee a column has
+#: exactly one legal committed value is for the column not to exist.
+_IDEMPOTENCY_FORBIDDEN_FIELDS = ("state", "status", "stage", "phase", "attempts", "retries")
+
+#: A134/A135: neither the fingerprint material nor the stored result may carry credential,
+#: session or transport material. Matched segment-wise so that an ordinary word containing
+#: one of these as a substring does not read as a violation.
+_IDEMPOTENCY_FORBIDDEN_VOCABULARY = frozenset(
+    {
+        "cookie",
+        "cookies",
+        "csrf",
+        "credential",
+        "credentials",
+        "password",
+        "secret",
+        "token",
+        "bearer",
+        "authorization",
+        "session",
+        "header",
+        "headers",
+    }
+)
+
+#: A136: the one heavy column, which the claim path never selects.
+_IDEMPOTENCY_HEAVY_COLUMN = "result_detail"
+
+_WORD = re.compile(r"[a-z0-9]+")
+
+
+def _is_idempotency(m: SourceModule) -> bool:
+    return under(m.dotted, "core.idempotency") and not m.is_migration
+
+
+def _assigned_field_names(tree: ast.Module) -> Iterator[tuple[str, int]]:
+    """Class-body `name = models.X(...)` assignments, i.e. declared columns."""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for statement in node.body:
+            if not isinstance(statement, ast.Assign) or not isinstance(statement.value, ast.Call):
+                continue
+            chain = _chain(statement.value.func)
+            if chain is None or "models" not in chain:
+                continue
+            for target in statement.targets:
+                if isinstance(target, ast.Name):
+                    yield target.id, statement.lineno
+
+
+@rule
+def a129_claim_is_a_postgresql_write(m: SourceModule, ctx: Context) -> Iterator[Violation]:
+    """A129 — no Redis, cache, in-process lock or advisory-lock path is the claim mechanism.
+
+    ADR-0015 §2: the durable PostgreSQL row is the only thing that decides whether a command
+    executes twice, whether a retry replays, whether a request is a conflict and who owns a
+    key. A Redis miss, flush, eviction, outage or cold start changes none of those four
+    answers, which is only true if no such call exists here at all.
+    """
+    if not _is_idempotency(m):
+        return
+    for imp in m.imports:
+        if any(under(imp.target, banned) for banned in _IDEMPOTENCY_FORBIDDEN_IMPORTS):
+            yield _v(
+                "A129",
+                m,
+                imp.line,
+                f"the idempotency claim imports {imp.target}; the claim is a PostgreSQL "
+                "write and nothing else stands in for it",
+            )
+    for node in ast.walk(m.tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            for banned in _IDEMPOTENCY_FORBIDDEN_CALLS:
+                if banned in node.value:
+                    yield _v(
+                        "A129",
+                        m,
+                        node.lineno,
+                        f"{banned} appears in the claim mechanism; contenders serialize on "
+                        "the durable uniqueness constraint, not on an advisory lock",
+                    )
+
+
+@rule
+def a130_unique_scope_key_constraint(m: SourceModule, ctx: Context) -> Iterator[Violation]:
+    """A130 — a `UNIQUE (scope, key)` database constraint exists on the idempotency model.
+
+    ADR-0015 §3 / master `# 5.4`. Declared in `Meta.constraints`, not as a `unique_together`
+    afterthought and not as a Python-side check: `Model.clean()` does not run on
+    `bulk_create`, on raw SQL, or on a concurrent writer.
+    """
+    if not _is_idempotency(m) or m.basename != "models.py":
+        return
+    for node in ast.walk(m.tree):
+        if not isinstance(node, ast.Call):
+            continue
+        chain = _chain(node.func)
+        if chain is None or chain[-1] != "UniqueConstraint":
+            continue
+        for keyword in node.keywords:
+            if keyword.arg != "fields":
+                continue
+            names = {
+                element.value
+                for element in getattr(keyword.value, "elts", [])
+                if isinstance(element, ast.Constant)
+            }
+            if names == {"scope", "key"}:
+                return
+    yield _v(
+        "A130",
+        m,
+        1,
+        "the idempotency model declares no UniqueConstraint over ('scope', 'key'); that "
+        "constraint is the mechanism, not an optimisation",
+    )
+
+
+@rule
+def a131_claim_commits_with_its_effect(m: SourceModule, ctx: Context) -> Iterator[Violation]:
+    """A131 — no idempotency write is committed outside the transaction performing the effect.
+
+    ADR-0015 §6 forbids the two-transaction pattern by name: no separate
+    `atomic(durable=True)`, no autocommit write, no `on_commit` claim. Nesting *is* allowed —
+    a savepoint is an implementation detail of one semantic command (item 4 §12) — so this
+    rule bans the durable/independent spellings, not `atomic()` itself.
+    """
+    if not _is_idempotency(m):
+        return
+    for node in ast.walk(m.tree):
+        if not isinstance(node, ast.Call):
+            continue
+        chain = _chain(node.func)
+        if chain is None:
+            continue
+        if chain[-1] == "atomic":
+            for keyword in node.keywords:
+                if keyword.arg == "durable" and not (
+                    isinstance(keyword.value, ast.Constant) and keyword.value.value is False
+                ):
+                    yield _v(
+                        "A131",
+                        m,
+                        node.lineno,
+                        "atomic(durable=True) makes the claim its own outermost "
+                        "transaction; the claim commits with the effect it protects",
+                    )
+        if chain[-1] in _IDEMPOTENCY_FORBIDDEN_TRANSACTION_CALLS and "transaction" in chain:
+            yield _v(
+                "A131",
+                m,
+                node.lineno,
+                f"transaction.{chain[-1]}() in the claim mechanism; the outer transaction "
+                "owns every durable write and its commit boundary",
+            )
+
+
+@rule
+def a132_no_durable_lifecycle_state(m: SourceModule, ctx: Context) -> Iterator[Violation]:
+    """A132 — the generic mechanism writes no durable `processing` or `failed` value.
+
+    ADR-0015 §6 refines master `# 5.2`'s `state` sketch: `processing` may exist only as
+    uncommitted, transaction-local state, and no durable `failed` state is required — so a
+    transient fault can never reserve a key forever. A column with exactly one legal
+    committed value is best expressed as no column.
+    """
+    if not _is_idempotency(m) or m.basename != "models.py":
+        return
+    for name, line in _assigned_field_names(m.tree):
+        if name in _IDEMPOTENCY_FORBIDDEN_FIELDS:
+            yield _v(
+                "A132",
+                m,
+                line,
+                f"the idempotency model declares a '{name}' column; the existence of a "
+                "committed row is the completed state, and no other is durable",
+            )
+
+
+@rule
+def a133_scope_comes_from_the_platform_set(m: SourceModule, ctx: Context) -> Iterator[Violation]:
+    """A133 — `scope` values come from a platform-owned constant set, never from request data.
+
+    Enforced structurally rather than by inspecting call sites: the only way to obtain a
+    `CommandScope` is `ScopeRegistry.resolve`, which refuses an unregistered name, and the
+    claim path must go through it. A caller that invents a scope therefore cannot claim.
+    """
+    if not _is_idempotency(m) or m.basename != "claim.py":
+        return
+    resolves = any(
+        isinstance(node, ast.Call)
+        and (chain := _chain(node.func)) is not None
+        and chain[-2:] == ["COMMAND_SCOPES", "resolve"]
+        for node in ast.walk(m.tree)
+    )
+    if not resolves:
+        yield _v(
+            "A133",
+            m,
+            1,
+            "the claim path does not resolve its scope through COMMAND_SCOPES.resolve(); a "
+            "scope is platform-owned and an unregistered one must not be claimable",
+        )
+
+
+@rule
+def a134_a135_no_credential_material(m: SourceModule, ctx: Context) -> Iterator[Violation]:
+    """A134 / A135 (vocabulary half) — no credential, session or transport material here.
+
+    A134: fingerprint material is a canonicalized semantic structure and carries no
+    credential, token, cookie or CSRF value. A135: stored result material is bounded and
+    carries none of those either, nor arbitrary request headers.
+
+    This is the *vocabulary* half, matched segment-wise so `is_fingerprint` does not read as
+    a violation. The behavioural half — that a given scope's material genuinely excludes such
+    values — belongs to each scope's own contract and to review: no static rule can look at a
+    string and know it is a bearer token.
+    """
+    if not _is_idempotency(m):
+        return
+    reported: set[int] = set()
+    for node in ast.walk(m.tree):
+        name: str | None = None
+        if isinstance(node, ast.Name):
+            name = node.id
+        elif isinstance(node, ast.Attribute):
+            name = node.attr
+        elif isinstance(node, ast.arg):
+            name = node.arg
+        elif isinstance(node, ast.FunctionDef | ast.ClassDef):
+            name = node.name
+        else:
+            continue
+        line = node.lineno
+        words = set(_WORD.findall(name.lower()))
+        offending = sorted(words & _IDEMPOTENCY_FORBIDDEN_VOCABULARY)
+        if offending and line not in reported:
+            reported.add(line)
+            rule_id = "A135" if m.basename in {"models.py", "outcomes.py"} else "A134"
+            yield _v(
+                rule_id,
+                m,
+                line,
+                f"'{name}' carries {offending[0]} vocabulary; neither the fingerprint nor "
+                "the stored result holds credential, session or transport material",
+            )
+
+
+@rule
+def a136_heavy_column_is_off_the_claim_path(m: SourceModule, ctx: Context) -> Iterator[Violation]:
+    """A136 — no heavy result column is selected while claiming (ADR-0015 §9, master `# 20.5`).
+
+    The claim path names its columns explicitly and the heavy one is absent from that list,
+    so it is loaded only when a replay actually needs it.
+    """
+    if not _is_idempotency(m) or m.basename != "claim.py":
+        return
+    for node in ast.walk(m.tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if not isinstance(target, ast.Name) or target.id != "_CLAIM_PATH_FIELDS":
+                continue
+            selected = {
+                element.value
+                for element in getattr(node.value, "elts", [])
+                if isinstance(element, ast.Constant)
+            }
+            if not selected:
+                yield _v(
+                    "A136",
+                    m,
+                    node.lineno,
+                    "the claim path selects no explicit column list; an unshaped read pulls "
+                    "the heavy result column on every claim",
+                )
+            elif _IDEMPOTENCY_HEAVY_COLUMN in selected:
+                yield _v(
+                    "A136",
+                    m,
+                    node.lineno,
+                    f"the claim path selects {_IDEMPOTENCY_HEAVY_COLUMN}; the heavy column "
+                    "is read only when a replay needs it",
+                )
+            return
+    yield _v(
+        "A136",
+        m,
+        1,
+        "the claim path declares no _CLAIM_PATH_FIELDS column list, so nothing keeps the "
+        "heavy result column off it",
+    )
+
+
+@rule
+def a137_event_identity_is_not_a_command_key(m: SourceModule, ctx: Context) -> Iterator[Violation]:
+    """A137 — no `EventId` is used as a command idempotency key.
+
+    ADR-0015 §1: these are two of the five separated duplicate-protection mechanisms. A
+    message delivery is deduplicated by the Inbox against `EventId`; a command invocation is
+    protected by `(scope, key)`. Neither is derivable from the other, and no `IdempotencyKey`
+    row is created to deduplicate a delivery.
+    """
+    if not _is_idempotency(m):
+        return
+    for imp in m.imports:
+        if under(imp.target, "core.events"):
+            yield _v(
+                "A137",
+                m,
+                imp.line,
+                f"the command-idempotency mechanism imports {imp.target}; message-delivery "
+                "identity and command identity are separate mechanisms (ADR-0015 §1)",
+            )
+
+
+@rule
+def a138_ownership_is_resolved_before_result(m: SourceModule, ctx: Context) -> Iterator[Violation]:
+    """A138 (structural half) — no replay path can bypass the owning-principal check.
+
+    ADR-0015 §4: a different principal presenting an existing key receives neither the
+    outcome nor confirmation that the key exists. Structurally: the refusal outcome carries
+    no fields at all, so nothing about the row can leak through it, and the replay outcome is
+    built in exactly one place. The behavioural half — that ownership is compared *before*
+    the fingerprint, and that the refusal returns no data — is asserted by test.
+    """
+    if not _is_idempotency(m) or m.basename != "claim.py":
+        return
+    builders = [
+        node.lineno
+        for node in ast.walk(m.tree)
+        if isinstance(node, ast.Call)
+        and (chain := _chain(node.func)) is not None
+        and chain[-1] == "SemanticResult"
+    ]
+    if len(builders) > 1:
+        for line in builders:
+            yield _v(
+                "A138",
+                m,
+                line,
+                "the replayed result is built in more than one place; a single construction "
+                "site is what keeps every replay behind the ownership check",
+            )
+
+
+# ---------------------------------------------------------------------------
+# The durable async spine (item 8, item 9, item 10, ADR-0010, ADR-0011)
+#
+# These rules exist because their subjects now physically exist. Each guards a
+# regression that ordinary review is unreliable against: a fifth trace field or a
+# metadata bag creeping in beside the closed four; a consumer writing its own span
+# into a message's slot; a back-fill rewriting durable history; and a terminal record
+# that cannot say which domain and which consumer it belongs to.
+#
+# Their *behavioural* halves — that a real producer captures the right state, that a
+# real relay never rewrites a row, that a real consumer's replay preserves identity —
+# need a producer, a consumer and a relay, none of which exists in this slice. Those
+# obligations are recorded as deferred in the phase artifact rather than claimed here.
+# ---------------------------------------------------------------------------
+
+#: The four TCE slots (item 10 FS1, FS2). Exactly these, on every durable message record.
+TCE_FIELDS: tuple[str, ...] = (
+    "trace_id",
+    "producer_span_id",
+    "request_id",
+    "causation_event_id",
+)
+
+#: Item 10 CN8: a *delivery's own* operational trace, per attempt, kept in storage distinct
+#: from the message's copy. Permitted precisely because it is not the message's TCE, and
+#: named here so A60 does not mistake it for a fifth envelope field.
+DELIVERY_TRACE_FIELDS: tuple[str, ...] = ("processing_trace_id", "processing_span_id")
+
+#: A60 / FS3: the extension point item 8 reserved was spent on a closed set, so none of these
+#: may appear beside it — in any spelling, including the "one JSON column for future use" that
+#: every metadata bag is eventually justified as.
+FORBIDDEN_ENVELOPE_FIELDS: frozenset[str] = frozenset(
+    {
+        "meta",
+        "metadata",
+        "extra",
+        "context",
+        "attributes",
+        "headers",
+        "tags",
+        "annotations",
+        "baggage",
+        "tracestate",
+        "traceparent",
+        "correlation_id",
+        "causation_id",
+        "span_id",
+        "parent_span_id",
+    }
+)
+
+#: A66: written once at message creation and never rewritten — not by a relay, a retry, a
+#: redelivery, a replay, a reconciliation, an admin action or a management command. The TCE
+#: fields are write-once too, but a violation there is reported under A62, which is the
+#: narrower and more specific rule.
+WRITE_ONCE_MESSAGE_FIELDS: tuple[str, ...] = (
+    "event_id",
+    "event_type",
+    "schema_version",
+    "occurred_at",
+    "payload",
+    "payload_fingerprint",
+    "first_seen_at",
+)
+
+#: A56: a terminal record is domain-scoped and names the consumer delivery that failed. A
+#: shared bucket without these discriminators is the global `dead_letters` table item 9 TI2
+#: forbids: a poison ERP batch must not sit undiscriminated beside a payment failure.
+TERMINAL_DISCRIMINATORS: tuple[str, ...] = ("terminal_kind", "failure_domain", "consumer")
+
+MESSAGE_PACKAGES = ("core.outbox", "core.inbox")
+
+CODEC_MODULE = "core.events.codec"
+
+
+def _is_message_machinery(m: SourceModule) -> bool:
+    return any(under(m.dotted, package) for package in MESSAGE_PACKAGES) and not m.is_migration
+
+
+def _update_calls(tree: ast.Module) -> Iterator[tuple[ast.Call, set[str]]]:
+    """Every `<...>.update(**kwargs)` call, with the column names it assigns."""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute) or func.attr != "update":
+            continue
+        yield node, {kw.arg for kw in node.keywords if kw.arg is not None}
+
+
+@rule
+def a60_the_tce_is_closed(m: SourceModule, ctx: Context) -> Iterator[Violation]:
+    """A60 — exactly four TCE fields exist on a durable message record, and no bag beside them.
+
+    Item 8 EN6 reserved **one** extension point and item 10 spent it on a closed named set
+    (FS1, FS2). There is no second extension point, so a fifth trace field does not exist and
+    a metadata bag cannot arrive disguised as a convenience: every precise meaning one could
+    carry is already carried by one of the eight envelope slots, and a bag is where routing,
+    attempt counters and — eventually — a value some handler branches on end up.
+    """
+    if not _is_message_machinery(m) or m.basename != "models.py":
+        return
+    for name, line in _assigned_field_names(m.tree):
+        if name in FORBIDDEN_ENVELOPE_FIELDS:
+            yield _v(
+                "A60",
+                m,
+                line,
+                f"a '{name}' column beside the envelope; the TCE is closed at "
+                f"{', '.join(TCE_FIELDS)}, and item 8 reserved no second extension point",
+            )
+
+
+@rule
+def a61_no_tce_name_in_a_payload(m: SourceModule, ctx: Context) -> Iterator[Violation]:
+    """A61 (codec half) — the payload gate rejects every envelope and trace slot name.
+
+    The envelope is not payload (EV3, item 8 EN11). A payload field named `trace_id` is how a
+    handler ends up branching on trace metadata (FW4, A63), and a payload field named
+    `event_id` is how a second, unversioned envelope grows beside the frozen one.
+
+    No registered payload contract module exists yet, so the *static* half of A61 — reading
+    declared contract fields — has no subject. What does exist is the single gate every
+    payload passes, and this rule keeps that gate's closed list from being quietly narrowed:
+    deleting a name from `RESERVED_PAYLOAD_FIELDS` would remove the protection with nothing
+    else failing. The obligation to check declared contracts is recorded as deferred.
+    """
+    if m.dotted != CODEC_MODULE:
+        return
+    for node in ast.walk(m.tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(t, ast.Name) and t.id == "RESERVED_PAYLOAD_FIELDS" for t in node.targets
+        ):
+            continue
+        declared = {
+            element.value
+            for element in ast.walk(node.value)
+            if isinstance(element, ast.Constant) and isinstance(element.value, str)
+        }
+        missing = sorted(set(TCE_FIELDS) - declared)
+        if missing:
+            yield _v(
+                "A61",
+                m,
+                node.lineno,
+                f"the payload gate no longer rejects {', '.join(missing)}; the envelope is "
+                f"not payload, and no payload field carries a trace value under any name",
+            )
+        return
+    yield _v(
+        "A61",
+        m,
+        1,
+        "the codec declares no RESERVED_PAYLOAD_FIELDS, so nothing stops a payload declaring "
+        "an envelope or trace slot as one of its own fields",
+    )
+
+
+@rule
+def a62_one_writer_per_trace_column(m: SourceModule, ctx: Context) -> Iterator[Violation]:
+    """A62 — no path outside message creation assigns a message's TCE column.
+
+    Item 10 SP3/CN3/PR2: no consumer, handler, relay, retry or replay path writes a span
+    identifier into a message row, and the delivery's own operational trace is a **separate**
+    target. The check is structural: a TCE value may reach the database only as a constructor
+    keyword at creation, never through a queryset `update()` and never through an attribute
+    assignment on a loaded row. `processing_trace_id` / `processing_span_id` are exempt by
+    name — CN8 requires exactly that separate pair, and it is mutable per attempt.
+    """
+    if not _is_message_machinery(m):
+        return
+    banned = set(TCE_FIELDS)
+
+    for node, assigned in _update_calls(m.tree):
+        for column in sorted(assigned & banned):
+            yield _v(
+                "A62",
+                m,
+                node.lineno,
+                f"update() assigns the message's '{column}'; the TCE is captured once at "
+                f"creation, and a delivery's own trace context is a separate column pair",
+            )
+
+    # Not `node`: that name is bound to the `ast.Call` of the loop above, and rebinding it
+    # here hid the expression type from the checker.
+    for statement in ast.walk(m.tree):
+        if not isinstance(statement, ast.Assign):
+            continue
+        for target in statement.targets:
+            if isinstance(target, ast.Attribute) and target.attr in banned:
+                yield _v(
+                    "A62",
+                    m,
+                    statement.lineno,
+                    f"'{target.attr}' is assigned on a loaded row; a message's trace context "
+                    f"has exactly one writer, at the durable INSERT",
+                )
+
+
+@rule
+def a66_message_fields_are_write_once(m: SourceModule, ctx: Context) -> Iterator[Violation]:
+    """A66 — no retry, replay, relay or admin path rewrites a message's durable identity.
+
+    Item 10 FS6/PR8/RP1: TCE state is immutable through every retry, redelivery, replay,
+    terminal transition and archival, and no later process back-fills a field the emission
+    left empty — a gap is a diagnostic fact, and rewriting history to hide it is worse than
+    the gap. The same holds for the message's own identity and payload: item 9 C77 requires
+    replay to preserve `event_id`, `event_type`, `schema_version`, `occurred_at` and payload
+    byte-for-byte, which a mechanism that can rewrite them cannot promise.
+    """
+    if not _is_message_machinery(m):
+        return
+    banned = set(WRITE_ONCE_MESSAGE_FIELDS)
+
+    for node, assigned in _update_calls(m.tree):
+        for column in sorted(assigned & banned):
+            yield _v(
+                "A66",
+                m,
+                node.lineno,
+                f"update() rewrites '{column}'; a durable message's identity and payload are "
+                f"written once and replayed byte-for-byte, never amended",
+            )
+
+
+@rule
+def a56_terminal_records_are_domain_scoped(m: SourceModule, ctx: Context) -> Iterator[Violation]:
+    """A56 — every terminal record names its kind, its origin domain and its consumer.
+
+    Item 9 TI2 forbids one global undifferentiated `dead_letters` bucket, and DL16/DL17 require
+    the record to name **which** consumer failed, because a failure domain shared by several
+    consumers cannot. One physical table is admissible only with an explicit terminal-kind
+    discriminator, so the three columns are checked together: any one of them missing turns the
+    table back into the shared bucket the rule exists to prevent.
+    """
+    if not _is_message_machinery(m) or m.basename != "models.py":
+        return
+    for node in ast.walk(m.tree):
+        # A `TextChoices` enum named for the discriminator is not the record that carries it,
+        # so the subject is narrowed to classes that actually define persistence.
+        if not isinstance(node, ast.ClassDef) or not node.name.endswith("Terminal"):
+            continue
+        if not any(
+            (chain := _chain(base)) is not None and chain[-1] == "Model" for base in node.bases
+        ):
+            continue
+        declared = {
+            name for name, _ in _assigned_field_names(ast.Module(body=[node], type_ignores=[]))
+        }
+        missing = [column for column in TERMINAL_DISCRIMINATORS if column not in declared]
+        if missing:
+            yield _v(
+                "A56",
+                m,
+                node.lineno,
+                f"class {node.name} declares no {', '.join(missing)}; a terminal record that "
+                f"cannot name its kind, its domain and its consumer is a global bucket",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Observability and the log surface (item 3 §4.5, item 10 §21, master `# 23.1`)
+# ---------------------------------------------------------------------------
+
+#: Item 3 §4.5: the `core` subset `integrations/*` may import must stay **pure Python** —
+#: importable without the Django app registry, because an adapter is a plain library that a
+#: provider test constructs directly. A Django import anywhere under one of these modules
+#: makes the whole allowlist entry unusable from an adapter.
+_DJANGO_FREE_CORE = INTEGRATIONS_CORE_ALLOWLIST
+
+#: A65 / PC2: no collector call, exporter flush, remote-sampler lookup or broker call on the
+#: observability path or the emission path — both of which run between `BEGIN` and `COMMIT` of
+#: a business transaction, where a network round trip cannot be allowed to sit.
+_NETWORK_FREE_PACKAGES = ("core.observability", "core.outbox")
+_NETWORK_MODULES = (
+    "socket",
+    "ssl",
+    "http",
+    "urllib",
+    "urllib3",
+    "requests",
+    "httpx",
+    "smtplib",
+    "ftplib",
+    "xmlrpc",
+    "redis",
+    "kombu",
+    "celery",
+    "amqp",
+)
+
+#: A63: the ambient readers of trace metadata, and the durable column names.
+_TCE_READERS = frozenset(
+    {
+        "current_trace_id",
+        "current_span_id",
+        "current_request_id",
+        "current_causation_event_id",
+    }
+)
+_TCE_FIELDS = frozenset(
+    {"trace_id", "span_id", "producer_span_id", "request_id", "causation_event_id"}
+)
+
+#: Families where reading a TCE value into a decision would be a business branch. `core` is
+#: excluded on purpose: PR2's pair-integrity check and the log formatter legitimately read
+#: these values, and both live in `core` precisely because that is the mechanism layer.
+_TCE_BRANCH_FAMILIES = frozenset({"domains", "application", "interfaces", "tasks"})
+
+#: The logging call surface, for `M23.1-MASK`.
+_LOG_METHODS = frozenset(
+    {"debug", "info", "warning", "warn", "error", "exception", "critical", "log"}
+)
+
+
+@rule
+def l10_core_open_to_integrations_is_pure_python(
+    m: SourceModule, ctx: Context
+) -> Iterator[Violation]:
+    """L10 — the `core` subset open to `integrations/*` imports no Django (item 3 §4.5)."""
+    if m.family != "core" or not any(under(m.dotted, allowed) for allowed in _DJANGO_FREE_CORE):
+        return
+    for ref in m.imports:
+        if _head(ref.target) == "django":
+            yield _v(
+                "L10",
+                m,
+                ref.line,
+                f"{m.dotted} imports {ref.target}; this module is on the subset "
+                f"integrations/* may import, which must stay importable without Django",
+            )
+
+
+@rule
+def a65_no_network_io_on_the_emission_path(m: SourceModule, ctx: Context) -> Iterator[Violation]:
+    """A65 — observability and emission perform no network I/O (item 10 PC2, §12)."""
+    if not any(under(m.dotted, package) for package in _NETWORK_FREE_PACKAGES):
+        return
+    for ref in m.imports:
+        if _head(ref.target) in _NETWORK_MODULES:
+            yield _v(
+                "A65",
+                m,
+                ref.line,
+                f"{m.dotted} imports {ref.target}; nothing on this path may call a "
+                f"collector, exporter, sampler or broker between BEGIN and COMMIT",
+            )
+
+
+def _tce_readers_bound_in(tree: ast.Module) -> set[str]:
+    """Names assigned directly from a TCE getter, so a branch on one is still caught."""
+    bound: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            continue
+        chain = _chain(node.value.func)
+        if chain is None or chain[-1] not in _TCE_READERS:
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                bound.add(target.id)
+    return bound
+
+
+def _reads_trace_metadata(node: ast.AST, bound: set[str]) -> int | None:
+    """The line where `node`'s subtree reads a TCE value, if it does."""
+    for inner in ast.walk(node):
+        if isinstance(inner, ast.Call):
+            chain = _chain(inner.func)
+            if chain is not None and chain[-1] in _TCE_READERS:
+                return inner.lineno
+        elif isinstance(inner, ast.Attribute) and inner.attr in _TCE_FIELDS:
+            return inner.lineno
+        elif isinstance(inner, ast.Name) and inner.id in bound:
+            return inner.lineno
+    return None
+
+
+@rule
+def a63_no_business_branch_on_trace_metadata(m: SourceModule, ctx: Context) -> Iterator[Violation]:
+    """A63 — no conditional, policy or filter reads trace metadata (item 10 FW1, FW4).
+
+    Trace metadata is observability only. The moment a branch reads it, a sampling decision, a
+    stripped header or a collector outage acquires a business consequence — which is exactly
+    what item 10's correctness firewall exists to make impossible.
+    """
+    if m.family not in _TCE_BRANCH_FAMILIES:
+        return
+    bound = _tce_readers_bound_in(m.tree)
+    for node in ast.walk(m.tree):
+        if isinstance(node, ast.If | ast.While | ast.IfExp):
+            test: ast.AST = node.test
+        elif isinstance(node, ast.Compare | ast.BoolOp):
+            test = node
+        else:
+            continue
+        line = _reads_trace_metadata(test, bound)
+        if line is not None:
+            yield _v(
+                "A63",
+                m,
+                line,
+                "a decision reads trace metadata; observability context never selects a "
+                "branch, a policy, a filter, an ordering or a route",
+            )
+
+
+def _log_call_target(node: ast.Call) -> str | None:
+    """`logger.warning` / `logging.info` / `self._log.error` -> the method name."""
+    chain = _chain(node.func)
+    if chain is None or len(chain) < 2 or chain[-1] not in _LOG_METHODS:
+        return None
+    return chain[-1] if any("log" in part.lower() for part in chain[:-1]) else None
+
+
+def _sensitive_name_in(node: ast.AST) -> tuple[str, int] | None:
+    for inner in ast.walk(node):
+        if isinstance(inner, ast.Attribute) and is_sensitive(inner.attr):
+            return inner.attr, inner.lineno
+        if isinstance(inner, ast.Name) and is_sensitive(inner.id):
+            return inner.id, inner.lineno
+    return None
+
+
+@rule
+def m23_1_no_sensitive_binding_reaches_a_log_call(
+    m: SourceModule, ctx: Context
+) -> Iterator[Violation]:
+    """`M23.1-MASK` — a sensitively-named binding is never handed to a logger.
+
+    `core.observability.masking` masks by **field name**, which cannot see a value interpolated
+    into a message or passed positionally. This is that rule's other half, and it shares the
+    runtime vocabulary rather than restating it, so the two can never disagree. It is an
+    implementation-level check on master `# 23.1`'s masking protocol, not a new architecture
+    rule, and carries no new `A` number.
+    """
+    if m.family not in _FAMILIES or m.family == "tests":
+        return
+    for node in ast.walk(m.tree):
+        if not isinstance(node, ast.Call) or _log_call_target(node) is None:
+            continue
+        for argument in node.args:
+            found = _sensitive_name_in(argument)
+            if found is not None:
+                yield _v(
+                    "M23.1-MASK",
+                    m,
+                    found[1],
+                    f"{found[0]!r} is passed into a log call, where name-based masking "
+                    f"cannot reach it; log a bounded, non-sensitive reference instead",
+                )
+        for keyword in node.keywords:
+            if keyword.arg == "extra" and isinstance(keyword.value, ast.Dict):
+                for key in keyword.value.keys:
+                    if isinstance(key, ast.Constant) and is_sensitive(key.value):
+                        yield _v(
+                            "M23.1-MASK",
+                            m,
+                            key.lineno,
+                            f"log context key {key.value!r} is masked at render time; a "
+                            f"value that must be withheld is not context worth passing",
+                        )
+            elif keyword.arg != "extra":
+                found = _sensitive_name_in(keyword.value)
+                if found is not None:
+                    yield _v(
+                        "M23.1-MASK",
+                        m,
+                        found[1],
+                        f"{found[0]!r} is passed into a log call, where name-based masking "
+                        f"cannot reach it; log a bounded, non-sensitive reference instead",
+                    )
+
+
+# ---------------------------------------------------------------------------
+# LK6 — bounded waits (item 5 §11.6, §20.3 LK6)
+# ---------------------------------------------------------------------------
+
+#: The session bounds the composition root delivers as libpq connection options, so that a
+#: connection carries them from the moment it opens. Re-setting one in SQL anywhere else
+#: silently widens or removes a bound the deployment believes it configured.
+_SESSION_BOUND_GUCS = ("statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout")
+
+_SESSION_BOUND_SQL = re.compile(
+    r"\bset\s+(?:local\s+|session\s+)?(" + "|".join(_SESSION_BOUND_GUCS) + r")\b",
+    re.IGNORECASE,
+)
+
+#: Technical faults that a bounded wait raises. Item 4 §13.5 keeps them untranslated all the
+#: way to the platform boundary; catching one in business code is precisely how a timeout
+#: becomes a fabricated business outcome. `IntegrityError` is deliberately **absent**: item 4
+#: §13.4 admits it at a nested savepoint when the violated invariant is identified by name,
+#: which is what the idempotency claim path does.
+_UNTRANSLATABLE_DB_FAULTS = frozenset({"DatabaseError", "OperationalError", "InterfaceError"})
+
+#: Scoped like A63, and for the same reason: `core` is the mechanism layer, where a relay or
+#: a retry loop legitimately handles a technical fault. `integrations` speaks to vendors, not
+#: to PostgreSQL. What must never launder a database fault is business code.
+_BOUNDED_WAIT_FAMILIES = frozenset({"domains", "application", "interfaces", "tasks"})
+
+
+@rule
+def lk6_bounded_waits(m: SourceModule, ctx: Context) -> Iterator[Violation]:
+    """LK6 — the bound is the composition root's, and exceeding one is a technical fault.
+
+    Item 5 §20.3 LK6 has two halves and this rule enforces both structurally:
+
+    * **the bound stands.** No production module re-sets a session timeout in SQL. The
+      composition root sets all three as libpq connection options, which no `SET` of its own
+      can be missing; a `SET statement_timeout = 0` further in is an escape hatch that
+      disables a deployment's configured bound with nothing at the call site to say so. A
+      maintenance run that genuinely needs a longer bound raises it through the environment
+      for that invocation, where it is visible in the command rather than buried in a module.
+    * **the fault is not laundered.** Business code does not catch `OperationalError` (or the
+      broader `DatabaseError`/`InterfaceError`). Item 5 §11.6: a bounded wait exceeded is a
+      technical fault propagating untranslated, never a business outcome — master `# 22.6`'s
+      "retryable business error" sketch is refined by the frozen artifact, which governs.
+
+    Like A63 this sees syntax, not semantics: a fault caught through an aliased name or
+    re-raised from a helper is beyond it, and stays item 5 V-tier review.
+    """
+    if m.family not in _FAMILIES or m.family == "tests":
+        return
+
+    for node in ast.walk(m.tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            found = _SESSION_BOUND_SQL.search(node.value)
+            if found is not None:
+                yield _v(
+                    "LK6",
+                    m,
+                    node.lineno,
+                    f"{found.group(1)} is re-set in SQL here; the bound belongs to the "
+                    "composition root's connection options, and a module that moves it "
+                    "disables a bound the deployment believes it configured",
+                )
+
+    if m.family not in _BOUNDED_WAIT_FAMILIES:
+        return
+
+    for node in ast.walk(m.tree):
+        if not isinstance(node, ast.ExceptHandler):
+            continue
+        if node.type is None:
+            yield _v(
+                "LK6",
+                m,
+                node.lineno,
+                "a bare `except:` swallows the technical fault a bounded wait raises; item 4 "
+                "§13.5 propagates it untranslated to the platform boundary",
+            )
+            continue
+        for caught in sorted(_exception_names(node.type) & _UNTRANSLATABLE_DB_FAULTS):
+            yield _v(
+                "LK6",
+                m,
+                node.lineno,
+                f"{caught} is caught here; a statement or lock timeout is a technical fault "
+                "(item 5 §11.6), never a business outcome, and never a retry decision this "
+                "layer makes",
             )
 
 

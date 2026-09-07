@@ -3,7 +3,9 @@
     "allow": [
       "Bash(python3 -)",
       "Skill(architecture-context)",
-      "Skill(architecture-context:*)"
+      "Skill(architecture-context:*)",
+      "Bash(awk '/^# 23\\\\./,/^# 24\\\\./' docs/architecture/ecommerce_architecture_2026_roadmap.md)",
+      "Bash(grep -n -E \"^#{2,3} |statement_timeout|sampling|Sentry|structured|log\")"
     ]
   }
 }

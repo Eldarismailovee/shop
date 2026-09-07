@@ -4,7 +4,14 @@
 Build the Moldova RO/RU e-commerce platform described in `docs/architecture/ecommerce_architecture_2026_roadmap.md`.
 Architecture baseline: v1.3 Security, Performance & Modular Architecture Hardened.
 **Phase 0 Architecture Freeze is COMPLETE / FROZEN** (items 1–15, ADR-0001…ADR-0016). Phase 0 produced
-documents and decisions only; no Django code, package, model, migration, setting or dependency exists yet.
+documents and decisions only. **Phase 1 is in progress**: slices 1–7 have shipped — repository bootstrap
+and the enforcement harness, the `core` primitives, the toolchain correction, `core.idempotency`, the
+Outbox/Inbox/terminal-state spine, the observability/request boundary (structured logging, masking,
+the security-event log, `request_id` binding), and the database connection discipline (psycopg pool,
+the three session bounds, rule LK6) — so Django code, packages, models, migrations and settings now
+exist.
+Each slice is recorded in `docs/architecture/phase-1/`; read the latest slice artifact's **Scope** and
+**Deferred** sections before assuming anything is or is not built.
 
 ## Architecture authority
 Read in this order and stop as soon as the question is answered:

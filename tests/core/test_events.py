@@ -73,7 +73,14 @@ def test_no_business_message_appears_by_default() -> None:
 
 
 def test_the_core_events_package_declares_no_payload_contract() -> None:
-    """A46: no module under `core/events` defines a message payload or business vocabulary."""
+    """A46: no module under `core/events` defines a message payload or business vocabulary.
+
+    Every name below is **mechanism** — envelope, identity, registry lookup, codec failure —
+    and the exact-set assertion is what stops a business message type arriving quietly. The
+    Outbox/Inbox slice added exactly one: `InvalidPayload`, a third contract-failure class
+    beside the two Slice 2 shipped, raised by the codec on both edges. It names no fact, no
+    owner and no domain.
+    """
     package = REPO_ROOT / "core" / "events"
     declared: set[str] = set()
     for path in sorted(package.rglob("*.py")):
@@ -82,6 +89,7 @@ def test_the_core_events_package_declares_no_payload_contract() -> None:
     assert declared == {
         "EventId",
         "Envelope",
+        "InvalidPayload",
         "MessageContractError",
         "MessageKind",
         "MessageRegistry",

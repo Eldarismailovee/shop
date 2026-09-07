@@ -4,12 +4,16 @@ version = "0.1.0"
 description = "Moldova RO/RU e-commerce platform"
 requires-python = "==3.14.*"
 # Runtime dependencies are added by the slice that first uses one. Celery, a cache
-# client, DRF, an email/SMS/CRM/search/pooler package and a connection pooler are all
-# deliberately absent: phase-1/01 §2 and phase-1/02 §1 record them as not added, and a
-# queue provisioned for an unenabled workload is forbidden by the launch cut (item 14).
+# client, DRF and an email/SMS/CRM/search package are all deliberately absent:
+# phase-1/01 §2 and phase-1/02 §1 record them as not added, and a queue provisioned
+# for an unenabled workload is forbidden by the launch cut (item 14).
+#
+# The `pool` extra is psycopg's **in-process** connection pool (master `# 22.6`), which
+# item 14 §22 case 12 classifies FOUNDATION. It is not an external connection pooler:
+# PgBouncer stays a closed infrastructure gate, added only on measured connection churn.
 dependencies = [
     "django==6.1.1",
-    "psycopg[binary]==3.3.5",
+    "psycopg[binary,pool]==3.3.5",
 ]
 
 [dependency-groups]
@@ -92,6 +96,13 @@ testpaths = ["tests"]
 # `--strict-markers` fails an unregistered marker instead of silently ignoring it;
 # `--strict-config` fails on an unknown key in this section rather than dropping it.
 addopts = "-q --strict-markers --strict-config"
+markers = [
+    # Item 3 A7's tier layout. The unit tier contacts no database, so `make test` and every
+    # CI job that calls it keep working with no PostgreSQL at all; the integration tier
+    # proves what only real PostgreSQL can — two connections racing on a unique constraint,
+    # a CHECK refusing a direct insert — and runs under `make test-db`.
+    "integration: requires a live PostgreSQL (run with `make test-db`)",
+]
 
 # ---------------------------------------------------------------------------
 # Architecture import contracts (Phase 0 item 3 §15.1, L1-L19)
@@ -240,6 +251,20 @@ name = "L20/L21 the public-contract primitives are closed to adapters"
 type = "forbidden"
 source_modules = ["integrations"]
 forbidden_modules = ["core.actor", "core.errors"]
+
+[[tool.importlinter.contracts]]
+# Item 3 L13 / ADR-0005 §1: `interfaces/*` may import `core.inbox` for durable webhook
+# ingest, but writing an event or claiming an idempotency key is a decision that belongs
+# below the transport boundary. `core.idempotency` physically exists as of the command
+# idempotency slice, so the rule graduates from tools/arch_check to a real contract, the
+# way L20/L21 did when the actor and error primitives appeared. `core.outbox` physically
+# exists as of the Outbox/Inbox slice and has now joined it, which completes L13's subject
+# list: `core.inbox` is deliberately absent, because L13 *opens* it to a transport for
+# durable webhook ingest (ADR-0004 §7).
+name = "L13 a transport never writes an event or claims an idempotency key"
+type = "forbidden"
+source_modules = ["interfaces"]
+forbidden_modules = ["core.idempotency", "core.outbox"]
 
 [[tool.importlinter.contracts]]
 name = "L18 a provider protocol surface carries no client or SDK code"
