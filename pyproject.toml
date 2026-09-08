@@ -11,8 +11,16 @@ requires-python = "==3.14.*"
 # The `pool` extra is psycopg's **in-process** connection pool (master `# 22.6`), which
 # item 14 §22 case 12 classifies FOUNDATION. It is not an external connection pooler:
 # PgBouncer stays a closed infrastructure gate, added only on measured connection churn.
+#
+# `httpx` is the outbound HTTP transport of `integrations/base` — item 14 §5.1 FOUNDATION.
+# Chosen over `requests` (which master `# 20.8` names only illustratively) because separate
+# connect/read/write/pool budgets are first-class in its `Timeout` type rather than a single
+# opaque number, and master `# 20.8` requires a connect/read/total budget by name. It is the
+# only generic HTTP client in the build, and `M20.8-TIMEOUT` keeps it inside
+# `integrations/base` so no call site can reach a network without the standard adapter.
 dependencies = [
     "django==6.1.1",
+    "httpx==0.28.1",
     "psycopg[binary,pool]==3.3.5",
 ]
 

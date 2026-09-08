@@ -571,6 +571,154 @@ def a3_integrations_are_pure_python(m: SourceModule, ctx: Context) -> Iterator[V
             )
 
 
+#: Anything that can open a connection to a host we do not run. Generic HTTP clients and
+#: the raw socket layer, plus the stdlib's own client modules — `urllib.parse` is absent on
+#: purpose, because splitting a URL string reaches no network.
+_NETWORK_CLIENTS = (
+    "aiohttp",
+    "http.client",
+    "httpcore",
+    "httplib2",
+    "httpx",
+    "requests",
+    "socket",
+    "urllib.request",
+    "urllib3",
+    "websocket",
+    "websockets",
+)
+
+#: The standard adapter (master `# 20.8`, item 9 PV7). It is the only home for a *generic*
+#: HTTP client; a vendor's own SDK still belongs under its `integrations/<v>` package,
+#: which A2 allows and this rule does not touch.
+_STANDARD_ADAPTER = "integrations.base"
+
+
+def _network_client(target: str) -> str | None:
+    for name in _NETWORK_CLIENTS:
+        if under(target, name):
+            return name
+    return None
+
+
+@rule
+def a2_network_clients_stay_in_integrations(m: SourceModule, ctx: Context) -> Iterator[Violation]:
+    """A2 — a client that talks to a provider host appears only under `integrations/*`.
+
+    Item 3 §15.2. The point is not tidiness: a domain, a use case or a view that opens its
+    own connection has an outbound dependency with no timeout budget, no breaker, no vendor
+    DTO and no failure domain — every guarantee master `# 20.8` makes is a guarantee about
+    code that went through the adapter, and this is the rule that leaves no other route.
+    """
+    if m.family not in _FAMILIES or m.family == "tests" or m.family == "integrations":
+        return
+    for imp in m.imports:
+        found = _network_client(imp.target)
+        if found is not None:
+            yield _v(
+                "A2",
+                m,
+                imp.line,
+                f"{found} is a network client; outbound access belongs to integrations/*, "
+                "behind the timeout budget, breaker and bounded retry of the standard adapter",
+            )
+
+
+@rule
+def m208_timeout_only_the_standard_adapter(m: SourceModule, ctx: Context) -> Iterator[Violation]:
+    """`M20.8-TIMEOUT` — master `# 20.8` §1 and the Phase 1 DoD, made structural.
+
+    > *"никакого HTTP без connect/read/total budget"* — and the Phase 1 exit criterion
+    > *"external client без timeout невозможен через стандартный adapter"*.
+
+    Two halves, and neither is about a number:
+
+    * **there is one door.** A generic HTTP client is importable only inside
+      `integrations/base`, whose transport cannot be constructed without a `TimeoutBudget`.
+      With A2 forbidding it above `integrations/*` and this rule forbidding it beside the
+      adapter, the unbounded call is not a thing a call site can write. A vendor SDK is a
+      different matter — it lives with its vendor, where A13 and the port contract hold it.
+    * **the door is not propped open.** `timeout=None` disables every bound in one keyword
+      and reads like configuration rather than like the escape hatch it is.
+
+    This carries an implementation identifier naming the frozen section it enforces, not a
+    new `A` number: item 3 §15.2's series is frozen, and inventing a member of it would
+    misrepresent an implementation choice as an architecture rule.
+    """
+    if m.family not in _FAMILIES or m.family == "tests":
+        return
+
+    if not under(m.dotted, _STANDARD_ADAPTER):
+        for imp in m.imports:
+            found = _network_client(imp.target)
+            if found is not None:
+                yield _v(
+                    "M20.8-TIMEOUT",
+                    m,
+                    imp.line,
+                    f"{found} is the generic HTTP layer; it belongs to {_STANDARD_ADAPTER}, "
+                    "which cannot be constructed without a connect/read/total budget",
+                )
+
+    for node in ast.walk(m.tree):
+        if not isinstance(node, ast.Call):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg != "timeout":
+                continue
+            if isinstance(keyword.value, ast.Constant) and keyword.value.value is None:
+                yield _v(
+                    "M20.8-TIMEOUT",
+                    m,
+                    node.lineno,
+                    "timeout=None removes the bound the standard adapter exists to "
+                    "guarantee; a call that may legitimately take longer raises its "
+                    "budget, it does not remove it",
+                )
+
+
+@rule
+def a13_provider_surfaces_stay_separate(m: SourceModule, ctx: Context) -> Iterator[Violation]:
+    """A13 — a provider package's two surfaces stay separate (item 3 §6.5).
+
+    `protocol/` is reusable by the inbound webhook boundary and carries no client or SDK
+    code; `outbound/` is the only surface that implements a port. The separation is what
+    lets `interfaces/webhooks/<provider>` verify a signature without gaining the ability to
+    make an outbound business call, which is L12/L17's premise.
+
+    L18 already forbids `protocol → outbound` as an import contract. This adds the two
+    halves a module-graph contract cannot see: a `protocol` module reaching the standard
+    adapter or a network client directly, and a port implemented from the wrong surface.
+    """
+    # `integrations/base` is shared mechanism, not a provider package: it has no protocol
+    # to keep separate and no port to implement.
+    if m.family != "integrations" or m.owner is None or m.owner == _STANDARD_ADAPTER:
+        return
+    segments = m.rel.split("/")[2:]
+    surface = segments[0].removesuffix(".py") if segments else ""
+
+    if surface == "protocol":
+        for imp in m.imports:
+            if _network_client(imp.target) is not None or under(imp.target, _STANDARD_ADAPTER):
+                yield _v(
+                    "A13",
+                    m,
+                    imp.line,
+                    f"a protocol surface imports {imp.target}; protocol support is codecs, "
+                    "signatures and constants, and never performs an outbound call",
+                )
+    elif surface != "outbound":
+        for imp in m.imports:
+            if re.fullmatch(r"application\.[a-z_]+\.ports(\..+)?", imp.target):
+                yield _v(
+                    "A13",
+                    m,
+                    imp.line,
+                    "only the outbound surface of a provider package implements a port "
+                    f"(this is {m.owner}/{surface or '<package root>'})",
+                )
+
+
 def _a5_units(tree: ast.Module) -> Iterator[tuple[str, int, list[ast.stmt]]]:
     """The A5 units of a module: each top-level view/task callable or class, plus module scope.
 
